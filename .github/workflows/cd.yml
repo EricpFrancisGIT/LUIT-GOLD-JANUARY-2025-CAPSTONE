@@ -1,0 +1,66 @@
+name: CD
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS creds
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Install Terraform
+        run: |
+          sudo apt-get update && sudo apt-get install -y unzip
+          curl -Ls https://releases.hashicorp.com/terraform/1.7.5/terraform_1.7.5_linux_amd64.zip -o tf.zip
+          sudo unzip -o tf.zip -d /usr/local/bin
+          rm tf.zip
+
+      # --- IMPORTANT: create ECR repos first (IaC only, targeted apply) ---
+      - name: Terraform (create only ECR repos, idempotent)
+        working-directory: terraform
+        run: |
+          if [ ! -f terraform.tfvars ]; then cp terraform.tfvars.example terraform.tfvars; fi
+          terraform init
+          terraform apply -auto-approve \
+            -target=aws_ecr_repository.scanner \
+            -target=aws_ecr_repository.action \
+            -target=aws_ecr_repository.ai
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build & push images (tag latest + main-SHA)
+        run: |
+          SHA="${{ github.sha }}"
+          for svc in scanner action ai_insights; do
+            # 'ai_insights' -> repo suffix 'ai', others keep their name
+            REPO_SUFFIX="${svc%_*}"
+            REPO="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/levelup-costops-${REPO_SUFFIX}"
+            docker build -t "$REPO:main-$SHA" -t "$REPO:latest" "lambdas/$svc"
+            docker push "$REPO:main-$SHA"
+            docker push "$REPO:latest"
+          done
+
+      - name: Terraform plan/apply (full stack with new image tags)
+        working-directory: terraform
+        run: |
+          # update image tags to the commit we just pushed
+          sed -i 's/scanner_image_tag *=.*/scanner_image_tag = "main-'${{ github.sha }}'"/' terraform.tfvars
+          sed -i 's/action_image_tag *=.*/action_image_tag = "main-'${{ github.sha }}'"/' terraform.tfvars
+          sed -i 's/ai_image_tag *=.*/ai_image_tag = "main-'${{ github.sha }}'"/' terraform.tfvars
+
+          terraform plan -var-file=terraform.tfvars -out=plan.out
+          terraform apply -auto-approve plan.out
