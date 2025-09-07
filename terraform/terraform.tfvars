@@ -1,0 +1,7 @@
+project         = "levelup-retail"
+aws_region      = "us-east-1"
+aws_account_id  = "593793059236"
+s3_bucket_name  = "levelup-retail-costops-bucket"
+scanner_image_tag = "bootstrap"
+action_image_tag  = "bootstrap"
+ai_image_tag      = "bootstrap"

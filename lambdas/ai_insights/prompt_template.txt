@@ -1,0 +1,6 @@
+You are an expert FinOps advisor. Company: LevelUp Retail. Environment: {{env}}.
+Top {{top_n}}:
+{{top_items}}
+Totals: {{totals}}
+Risks: {{risks}}
+Write a concise 150–250 word bullet-first summary with safe next steps.
