@@ -51,51 +51,89 @@ def s3_idle(bucket):
 
 def handler(event, context):
     run_ts = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    all_reports = {}
+    summary = {}
 
     for env in ENVIRONMENTS:
         idle_ec2, idle_s3 = [], []
-        for inst in list_instances():
-            iid = inst["InstanceId"]; itype = inst.get("InstanceType","unknown")
-            state = inst.get("State",{}).get("Name"); tags = {t["Key"]:t["Value"] for t in inst.get("Tags",[])}
-            if tags.get("Env","staging") != env or state != "running": continue
+
+        # EC2 pass
+        for inst in list_instances(state_names=("running",)):
+            iid   = inst["InstanceId"]
+            itype = inst.get("InstanceType", "unknown")
+            state = inst.get("State", {}).get("Name")
+            tags  = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+            if tags.get("Env", "staging") != env or state != "running":
+                continue
+
             avg = cpu_avg(iid, CPU_IDLE_DAYS)
+            if avg is None:
+                continue  # insufficient data (if you adopt the hardened cpu_avg)
             if avg < CPU_IDLE_THRESHOLD:
-                est = price(itype)*24*30
+                est = round(price(itype) * 24 * 30, 2)
                 idle_ec2.append({
-                    "resource_id":iid,"resource_type":"ec2","env":env,"last_seen":run_ts,
-                    "idle_reason":f"CPU<{CPU_IDLE_THRESHOLD}% avg {CPU_IDLE_DAYS}d ({avg:.2f}%)",
-                    "metrics_snapshot":{"cpu_avg":avg,"days":CPU_IDLE_DAYS},
-                    "estimated_monthly_cost_savings":round(est,2),
-                    "risk_flags":["missing-tags"] if "Name" not in tags else []
+                    "resource_id": iid,
+                    "resource_type": "ec2",
+                    "env": env,
+                    "last_seen": run_ts,
+                    "idle_reason": f"CPU<{CPU_IDLE_THRESHOLD}% avg {CPU_IDLE_DAYS}d ({avg:.2f}%)",
+                    "metrics_snapshot": {"cpu_avg": avg, "days": CPU_IDLE_DAYS},
+                    "estimated_monthly_cost_savings": est,
+                    "risk_flags": ["missing-tags"] if "Name" not in tags else []
                 })
 
+        # S3 pass (filter buckets to this env via tag)
         for b in s3.list_buckets()["Buckets"]:
-            name=b["Name"]; is_idle, reason = s3_idle(name)
+            name = b["Name"]
+            try:
+                tagset = s3.get_bucket_tagging(Bucket=name).get("TagSet", [])
+                btags  = {t["Key"]: t["Value"] for t in tagset}
+            except Exception:
+                btags = {}
+            if btags.get("Env") != env:
+                continue
+
+            is_idle, reason = s3_idle(name)
             if is_idle:
                 idle_s3.append({
-                    "resource_id":name,"resource_type":"s3","env":env,"last_seen":run_ts,
-                    "idle_reason":f"S3 {reason}","metrics_snapshot":{},
-                    "estimated_monthly_cost_savings":0.0,"risk_flags":[]
+                    "resource_id": name,
+                    "resource_type": "s3",
+                    "env": env,
+                    "last_seen": run_ts,
+                    "idle_reason": f"S3 {reason}",
+                    "metrics_snapshot": {},
+                    "estimated_monthly_cost_savings": 0.0,
+                    "risk_flags": []
                 })
 
         findings = idle_ec2 + idle_s3
-        totals = {"ec2":len(idle_ec2),"s3":len(idle_s3),"overall":len(findings),
-                  "estimated_monthly_cost_savings": round(sum(f["estimated_monthly_cost_savings"] for f in findings),2)}
+        totals = {
+            "ec2": len(idle_ec2),
+            "s3": len(idle_s3),
+            "overall": len(findings),
+            "estimated_monthly_cost_savings": round(sum(f["estimated_monthly_cost_savings"] for f in findings), 2),
+        }
 
+        # Metrics
         put_metric("IdleEC2Count", totals["ec2"], env)
+        put_metric("IdleS3Count", totals["s3"], env)
+        put_metric("FindingsTotal", totals["overall"], env)
         put_metric("EstimatedMonthlySavings", totals["estimated_monthly_cost_savings"], env, unit="None")
 
+        # Persist findings (consider batch_writer or a single report)
         for f in findings:
             ddb.put_item(TableName=TABLE, Item={
-                "pk":{"S":env},"sk":{"S":f"{run_ts}#{f['resource_type']}#{f['resource_id']}"},
-                "gsi1pk":{"S":f"run#{env}"},"gsi1sk":{"S":run_ts},
-                "payload":{"S":json.dumps(f)}
+                "pk":    {"S": env},
+                "sk":    {"S": f"{run_ts}#{f['resource_type']}#{f['resource_id']}"},
+                "gsi1pk":{"S": f"run#{env}"},
+                "gsi1sk":{"S": run_ts},
+                "payload":{"S": json.dumps(f)}
             })
 
-        key=f"{env}/reports/{run_ts}.json"
-        body=json.dumps({"run_id":run_ts,"env":env,"totals":totals,"findings":findings}, indent=2)
-        s3.put_object(Bucket=BUCKET, Key=key, Body=body.encode("utf-8"), ContentType="application/json")
-        all_reports[env]={"key":key,"totals":totals}
+        # Optional: write full report file
+        report_obj = {"run_id": run_ts, "env": env, "totals": totals, "findings": findings}
+        s3.put_object(Bucket=BUCKET, Key=f"{env}/reports/{run_ts}.json",
+                      Body=json.dumps(report_obj).encode("utf-8"), ContentType="application/json")
 
-    return {"ok":True,"reports":all_reports}
+        summary[env] = totals
+
+    return {"ok": True, "run_id": run_ts, "summary": summary}
